@@ -9,10 +9,8 @@ Required:
     py -3 -m pip install pillow
 
 Optional SVG support:
-    py -3 -m pip install cairosvg
-
-Recommended SVG fallback renderer:
-    Install Inkscape and leave SVG Renderer set to Auto.
+    Install Inkscape and leave SVG renderer set to Auto or Inkscape.
+    CairoSVG can also work, but on Windows it requires the native Cairo/GTK libraries.
 """
 
 from __future__ import annotations
@@ -43,11 +41,7 @@ except ImportError:  # pragma: no cover
     root.withdraw()
     messagebox.showerror(
         "Missing Dependency",
-        "Pillow is required.
-
-Install it with:
-
-py -3 -m pip install pillow",
+        "Pillow is required.\n\nInstall it with:\n\npy -3 -m pip install pillow",
     )
     raise SystemExit(1)
 
@@ -64,6 +58,7 @@ ACCENT = "#1976d2"
 SUCCESS = "#2e7d32"
 WARNING = "#ef6c00"
 SOFT_BG = "#f5f8fc"
+SECTION_TEXT = "#263238"
 
 
 @dataclass
@@ -86,9 +81,9 @@ class ConversionOptions:
     padding: float
     background: tuple[int, int, int, int] | None
     supersample: int
+    svg_renderer: str
     existing_mode: str
     dry_run: bool
-    svg_renderer: str
 
 
 @dataclass
@@ -125,8 +120,14 @@ class ToolTip:
         self.after_id = None
         if self.tipwindow or not self.text:
             return
-        x = self.widget.winfo_rootx() + 16
-        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 10
+
+        try:
+            x, y, _width, height = self.widget.bbox("insert")
+        except Exception:
+            x = y = height = 0
+
+        x = x + self.widget.winfo_rootx() + 16
+        y = y + self.widget.winfo_rooty() + height + 16
         self.tipwindow = tw = tk.Toplevel(self.widget)
         tw.wm_overrideredirect(True)
         tw.wm_geometry(f"+{x}+{y}")
@@ -156,7 +157,10 @@ def parse_background(value: str) -> tuple[int, int, int, int] | None:
     if normalized in {"", "none", "transparent", "alpha"}:
         return None
     try:
-        return ImageColor.getcolor(value, "RGBA")
+        color = ImageColor.getcolor(value, "RGBA")
+        if len(color) == 3:
+            return color[0], color[1], color[2], 255
+        return color[0], color[1], color[2], color[3]
     except ValueError as exc:
         raise ValueError(
             "Background must be Transparent, a named color, or a HEX value like #ffffff."
@@ -206,78 +210,97 @@ def uniquify_path(path: Path) -> Path:
     raise RuntimeError(f"Could not create a unique file name for {path}")
 
 
-def summarize_svg_renderer_error(exc: Exception, renderer: str) -> str:
-    text = str(exc)
-    low = text.lower()
-    if "cairo" in low and ("no library" in low or "cannot load library" in low):
-        return (
-            "CairoSVG is installed, but the native Cairo graphics library is missing. "
-            "Install Inkscape and set SVG Renderer to Auto or Inkscape, or install GTK/Cairo for Windows."
-        )
-    if renderer == "inkscape" and ("not found" in low or "inkscape" in low):
-        return "Inkscape was not found. Install Inkscape, add it to PATH, or choose CairoSVG after installing Cairo."
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    return lines[0] if lines else f"SVG rendering failed with {renderer}."
+def is_missing_cairo_error(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return any(
+        marker in text
+        for marker in [
+            "no library called",
+            "cairo-2",
+            "libcairo",
+            "cannot load library",
+        ]
+    )
 
 
-def find_inkscape_executable() -> str | None:
-    candidates: list[str] = []
-    path_match = shutil.which("inkscape")
-    if path_match:
-        candidates.append(path_match)
+def concise_error(exc: BaseException, max_length: int = 260) -> str:
+    text = " ".join(str(exc).split())
+    if len(text) > max_length:
+        return text[: max_length - 3] + "..."
+    return text
 
-    program_files = [
+
+def find_inkscape() -> str | None:
+    exe = shutil.which("inkscape") or shutil.which("inkscape.exe")
+    if exe:
+        return exe
+
+    possible_roots = [
         os.environ.get("ProgramFiles"),
         os.environ.get("ProgramFiles(x86)"),
         os.environ.get("LOCALAPPDATA"),
     ]
-    for base in program_files:
-        if not base:
-            continue
-        candidates.extend(
-            [
-                str(Path(base) / "Inkscape" / "bin" / "inkscape.exe"),
-                str(Path(base) / "Programs" / "Inkscape" / "bin" / "inkscape.exe"),
-            ]
-        )
+    possible_paths: list[Path] = []
+    for root in possible_roots:
+        if root:
+            possible_paths.extend(
+                [
+                    Path(root) / "Inkscape" / "bin" / "inkscape.exe",
+                    Path(root) / "Programs" / "Inkscape" / "bin" / "inkscape.exe",
+                ]
+            )
 
-    for candidate in candidates:
-        if candidate and Path(candidate).exists():
-            return candidate
+    for path in possible_paths:
+        if path.exists():
+            return str(path)
     return None
 
 
-def load_svg_with_cairosvg(path: Path, render_width: int) -> Image.Image:
+def render_svg_with_cairosvg(path: Path, render_width: int) -> Image.Image:
     try:
         import cairosvg  # type: ignore
     except ImportError as exc:
         raise RuntimeError("CairoSVG is not installed. Install it with: py -3 -m pip install cairosvg") from exc
 
-    png_bytes = cairosvg.svg2png(url=str(path), output_width=render_width)
+    try:
+        png_bytes = cairosvg.svg2png(url=str(path), output_width=render_width)
+    except Exception as exc:  # noqa: BLE001
+        if is_missing_cairo_error(exc):
+            raise RuntimeError(
+                "CairoSVG is installed, but the native Cairo graphics library was not found. "
+                "Install GTK/Cairo for Windows or use the Inkscape SVG renderer."
+            ) from exc
+        raise RuntimeError(f"CairoSVG could not render this SVG: {concise_error(exc)}") from exc
+
     image = Image.open(BytesIO(png_bytes))
     image.load()
     return image.convert("RGBA")
 
 
-def load_svg_with_inkscape(path: Path, render_width: int) -> Image.Image:
-    inkscape = find_inkscape_executable()
-    if not inkscape:
-        raise RuntimeError("Inkscape executable was not found.")
+def render_svg_with_inkscape(path: Path, render_width: int) -> Image.Image:
+    exe = find_inkscape()
+    if not exe:
+        raise RuntimeError(
+            "Inkscape was not found. Install Inkscape or add inkscape.exe to PATH, "
+            "then choose the Inkscape or Auto SVG renderer."
+        )
 
-    with tempfile.TemporaryDirectory(prefix="ico-svg-") as temp_dir:
-        temp_png = Path(temp_dir) / f"{path.stem}.png"
+    with tempfile.TemporaryDirectory(prefix="ico-svg-render-") as temp_dir:
+        output_png = Path(temp_dir) / "rendered.png"
         command = [
-            inkscape,
+            exe,
             str(path),
             "--export-type=png",
-            f"--export-filename={temp_png}",
+            f"--export-filename={output_png}",
             f"--export-width={render_width}",
+            "--export-background-opacity=0",
         ]
         completed = subprocess.run(command, capture_output=True, text=True, check=False)
-        if completed.returncode != 0 or not temp_png.exists():
-            message = completed.stderr.strip() or completed.stdout.strip() or "Inkscape SVG export failed."
-            raise RuntimeError(message)
-        image = Image.open(temp_png)
+        if completed.returncode != 0 or not output_png.exists():
+            stderr = completed.stderr.strip() or completed.stdout.strip() or "Unknown Inkscape export error."
+            raise RuntimeError(f"Inkscape could not render this SVG: {concise_error(RuntimeError(stderr))}")
+
+        image = Image.open(output_png)
         image.load()
         return image.convert("RGBA")
 
@@ -288,21 +311,28 @@ def load_svg(path: Path, render_width: int, renderer: str) -> Image.Image:
 
     if renderer in {"auto", "cairosvg"}:
         try:
-            return load_svg_with_cairosvg(path, render_width)
+            return render_svg_with_cairosvg(path, render_width)
         except Exception as exc:  # noqa: BLE001
-            errors.append(f"CairoSVG: {summarize_svg_renderer_error(exc, 'cairosvg')}")
+            errors.append(f"CairoSVG: {concise_error(exc)}")
             if renderer == "cairosvg":
                 raise RuntimeError(errors[-1]) from exc
 
     if renderer in {"auto", "inkscape"}:
         try:
-            return load_svg_with_inkscape(path, render_width)
+            return render_svg_with_inkscape(path, render_width)
         except Exception as exc:  # noqa: BLE001
-            errors.append(f"Inkscape: {summarize_svg_renderer_error(exc, 'inkscape')}")
+            errors.append(f"Inkscape: {concise_error(exc)}")
             if renderer == "inkscape":
                 raise RuntimeError(errors[-1]) from exc
 
-    raise RuntimeError("; ".join(errors) if errors else "No SVG renderer is available.")
+    if not errors:
+        errors.append(f"Unknown SVG renderer: {renderer}")
+
+    raise RuntimeError(
+        "Could not render SVG. "
+        + " | ".join(errors)
+        + " Recommended fix: install Inkscape, then use SVG renderer = Auto or Inkscape."
+    )
 
 
 def load_image(path: Path, max_icon_size: int, supersample: int, svg_renderer: str) -> Image.Image:
@@ -336,7 +366,12 @@ def prepare_square_icon(
     if fit == "stretch":
         prepared = image.resize((inner_size, inner_size), RESAMPLE_LANCZOS)
     elif fit == "cover":
-        prepared = ImageOps.fit(image, (inner_size, inner_size), method=RESAMPLE_LANCZOS, centering=(0.5, 0.5))
+        prepared = ImageOps.fit(
+            image,
+            (inner_size, inner_size),
+            method=RESAMPLE_LANCZOS,
+            centering=(0.5, 0.5),
+        )
     else:
         prepared = image.copy()
         prepared.thumbnail((inner_size, inner_size), RESAMPLE_LANCZOS)
@@ -381,6 +416,7 @@ def convert_one(source: Path, root: Path, options: ConversionOptions) -> Convers
 
         target.parent.mkdir(parents=True, exist_ok=True)
         base_icon.save(target, format="ICO", sizes=[(size, size) for size in options.sizes])
+
         return ConversionResult(source, target, "converted", "OK", source_size, ico_sizes)
     except Exception as exc:  # noqa: BLE001
         return ConversionResult(source, target, "error", str(exc), ico_sizes=ico_sizes)
@@ -416,14 +452,10 @@ def write_desktop_ini(folder: Path, icon_path: Path, apply_attributes: bool) -> 
         icon_reference = icon_path
 
     ini_text = (
-        "[.ShellClassInfo]
-"
-        f"IconResource={icon_reference},0
-"
-        f"IconFile={icon_reference}
-"
-        "IconIndex=0
-"
+        "[.ShellClassInfo]\n"
+        f"IconResource={icon_reference},0\n"
+        f"IconFile={icon_reference}\n"
+        "IconIndex=0\n"
     )
     ini_path.write_text(ini_text, encoding="utf-8")
 
@@ -445,7 +477,9 @@ def write_desktop_ini_for_results(results: list[ConversionResult], apply_attribu
     messages: list[str] = []
     for folder, icons in sorted(generated_by_folder.items()):
         if len(icons) != 1:
-            messages.append(f"Skipped desktop.ini for {folder}: found {len(icons)} generated icons in that folder.")
+            messages.append(
+                f"Skipped desktop.ini for {folder}: found {len(icons)} generated icons in that folder."
+            )
             continue
         try:
             messages.append(write_desktop_ini(folder, icons[0], apply_attributes))
@@ -474,6 +508,12 @@ class SizesMenu(ttk.Menubutton):
     def selected_sizes(self) -> list[int]:
         return [size for size in self._sizes if self._vars[size].get()]
 
+    def set_selected(self, selected: list[int]) -> None:
+        selected_set = set(selected)
+        for size, var in self._vars.items():
+            var.set(size in selected_set)
+        self.refresh_text()
+
     def select_all(self) -> None:
         for var in self._vars.values():
             var.set(True)
@@ -486,15 +526,18 @@ class SizesMenu(ttk.Menubutton):
 
     def refresh_text(self) -> None:
         selected = self.selected_sizes()
-        self.display_var.set("Choose sizes…" if not selected else ", ".join(str(size) for size in selected))
+        if not selected:
+            self.display_var.set("Choose sizes…")
+        else:
+            self.display_var.set(", ".join(str(size) for size in selected))
 
 
 class IcoConverterApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title(APP_TITLE)
-        self.root.geometry("1100x900")
-        self.root.minsize(1060, 860)
+        self.root.geometry("1160x900")
+        self.root.minsize(1080, 840)
         self.root.configure(bg=SOFT_BG)
 
         self.work_queue: queue.Queue[tuple[str, object]] = queue.Queue()
@@ -536,16 +579,18 @@ class IcoConverterApp:
         if "clam" in style.theme_names():
             style.theme_use("clam")
 
-        style.configure("Root.TFrame", background=SOFT_BG)
-        style.configure("White.TFrame", background="white")
         style.configure("Title.TLabel", font=("Segoe UI", 16, "bold"), background=SOFT_BG)
         style.configure("Subtle.TLabel", foreground="#52616b", background=SOFT_BG)
-        style.configure("Card.TLabelframe", background="white", borderwidth=1, relief="solid")
-        style.configure("Card.TLabelframe.Label", font=("Segoe UI", 10, "bold"), foreground=ACCENT, background="white")
+        style.configure("Card.TLabelframe", background="white")
+        style.configure(
+            "Card.TLabelframe.Label",
+            font=("Segoe UI", 10, "bold"),
+            foreground=SECTION_TEXT,
+            background="white",
+        )
+        style.configure("Outer.TFrame", background=SOFT_BG)
         style.configure("TFrame", background="white")
-        style.configure("TLabel", background="white")
-        style.configure("TCheckbutton", background="white")
-        style.configure("TRadiobutton", background="white")
+        style.configure("White.TFrame", background="white")
         style.configure("Primary.TButton", foreground="white", background=ACCENT, padding=(12, 8))
         style.map("Primary.TButton", background=[("active", "#1565c0")])
         style.configure("Success.TButton", foreground="white", background=SUCCESS, padding=(12, 8))
@@ -553,15 +598,18 @@ class IcoConverterApp:
         style.configure("Soft.TButton", padding=(10, 7))
         style.configure("LogToggle.TButton", foreground="white", background=WARNING, padding=(10, 6))
         style.map("LogToggle.TButton", background=[("active", "#e65100")])
+        style.configure("TCheckbutton", background="white")
+        style.configure("TRadiobutton", background="white")
+        style.configure("TLabel", background="white")
 
     def add_tip(self, widget: tk.Widget, text: str) -> None:
         self.tooltips.append(ToolTip(widget, text))
 
     def build_ui(self) -> None:
-        outer = ttk.Frame(self.root, padding=14, style="Root.TFrame")
+        outer = ttk.Frame(self.root, padding=14, style="Outer.TFrame")
         outer.pack(fill="both", expand=True)
 
-        header = ttk.Frame(outer, style="Root.TFrame")
+        header = ttk.Frame(outer, style="Outer.TFrame")
         header.pack(fill="x", pady=(0, 10))
         ttk.Label(header, text="ICO Batch Converter", style="Title.TLabel").pack(anchor="w")
         ttk.Label(
@@ -570,15 +618,15 @@ class IcoConverterApp:
             style="Subtle.TLabel",
         ).pack(anchor="w", pady=(3, 0))
 
-        self.main = ttk.Frame(outer, style="White.TFrame")
-        self.main.pack(fill="both", expand=True)
-        self.main.columnconfigure(0, weight=1)
+        main = ttk.Frame(outer, style="White.TFrame")
+        main.pack(fill="both", expand=True)
+        main.columnconfigure(0, weight=1)
 
-        self.build_sources_section(self.main)
-        self.build_output_section(self.main)
-        self.build_options_section(self.main)
-        self.build_action_section(self.main)
-        self.build_log_section(self.main)
+        self.build_sources_section(main)
+        self.build_output_section(main)
+        self.build_options_section(main)
+        self.build_action_section(main)
+        self.build_log_section(main)
 
     def build_sources_section(self, parent: ttk.Frame) -> None:
         frame = ttk.LabelFrame(parent, text="Source Artwork", padding=10, style="Card.TLabelframe")
@@ -591,7 +639,7 @@ class IcoConverterApp:
         list_frame.columnconfigure(0, weight=1)
         list_frame.rowconfigure(0, weight=1)
 
-        self.source_listbox = tk.Listbox(list_frame, height=6, selectmode="extended")
+        self.source_listbox = tk.Listbox(list_frame, height=5, selectmode="extended")
         self.source_listbox.grid(row=0, column=0, sticky="nsew")
         scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=self.source_listbox.yview)
         scrollbar.grid(row=0, column=1, sticky="ns")
@@ -636,7 +684,10 @@ class IcoConverterApp:
         self.output_entry.grid(row=1, column=1, sticky="ew", padx=(8, 8), pady=(8, 0))
         self.output_button = ttk.Button(frame, text="Browse", style="Soft.TButton", command=self.choose_output_folder)
         self.output_button.grid(row=1, column=2, pady=(8, 0))
-        self.add_tip(self.output_entry, "Choose a central output folder if you do not want files saved next to the source artwork.")
+        self.add_tip(
+            self.output_entry,
+            "Choose a central output folder if you do not want files saved next to the source artwork.",
+        )
         self.add_tip(self.output_button, "Browse for a target output folder.")
 
         self.preserve_tree_check = ttk.Checkbutton(
@@ -651,47 +702,97 @@ class IcoConverterApp:
         frame = ttk.LabelFrame(parent, text="Icon Options", padding=10, style="Card.TLabelframe")
         frame.grid(row=2, column=0, sticky="ew", pady=(0, 10))
         for col in range(5):
-            frame.columnconfigure(col, weight=1)
+            frame.columnconfigure(col, weight=1, uniform="icon_options")
 
-        labels = [
-            ("ICO sizes", 0),
-            ("Fit mode", 1),
-            ("Existing files", 2),
-            ("SVG renderer", 3),
-            ("SVG edge quality", 4),
-        ]
-        for text, col in labels:
-            ttk.Label(frame, text=text).grid(row=0, column=col, sticky="w")
+        lbl_sizes = ttk.Label(frame, text="ICO sizes")
+        lbl_sizes.grid(row=0, column=0, sticky="w")
+        lbl_fit = ttk.Label(frame, text="Fit mode")
+        lbl_fit.grid(row=0, column=1, sticky="w")
+        lbl_existing = ttk.Label(frame, text="Existing files")
+        lbl_existing.grid(row=0, column=2, sticky="w")
+        lbl_renderer = ttk.Label(frame, text="SVG renderer")
+        lbl_renderer.grid(row=0, column=3, sticky="w")
+        lbl_svg = ttk.Label(frame, text="SVG edge quality")
+        lbl_svg.grid(row=0, column=4, sticky="w")
 
         self.sizes_menu = SizesMenu(frame, DEFAULT_ICO_SIZES, DEFAULT_ICO_SIZES)
         self.sizes_menu.grid(row=1, column=0, sticky="ew", padx=(0, 10))
-        cmb_fit = ttk.Combobox(frame, textvariable=self.fit_var, values=["contain", "cover", "stretch"], state="readonly")
+        cmb_fit = ttk.Combobox(
+            frame,
+            textvariable=self.fit_var,
+            values=["contain", "cover", "stretch"],
+            state="readonly",
+        )
         cmb_fit.grid(row=1, column=1, sticky="ew", padx=(0, 10))
-        cmb_existing = ttk.Combobox(frame, textvariable=self.existing_mode_var, values=["skip", "overwrite", "unique"], state="readonly")
+        cmb_existing = ttk.Combobox(
+            frame,
+            textvariable=self.existing_mode_var,
+            values=["skip", "overwrite", "unique"],
+            state="readonly",
+        )
         cmb_existing.grid(row=1, column=2, sticky="ew", padx=(0, 10))
-        cmb_renderer = ttk.Combobox(frame, textvariable=self.svg_renderer_var, values=["auto", "inkscape", "cairosvg"], state="readonly")
+        cmb_renderer = ttk.Combobox(
+            frame,
+            textvariable=self.svg_renderer_var,
+            values=["auto", "inkscape", "cairosvg"],
+            state="readonly",
+        )
         cmb_renderer.grid(row=1, column=3, sticky="ew", padx=(0, 10))
         spn_svg = ttk.Spinbox(frame, from_=1, to=8, textvariable=self.supersample_var, width=8)
         spn_svg.grid(row=1, column=4, sticky="ew")
 
         self.add_tip(self.sizes_menu, "Choose one or more embedded icon sizes to include in the ICO file.")
-        self.add_tip(cmb_fit, "Contain = preserve the whole image. Cover = fill the icon and crop overflow. Stretch = force the image into a square.")
-        self.add_tip(cmb_existing, "Skip leaves existing ICOs alone. Overwrite replaces them. Unique creates files like name (2).ico.")
-        self.add_tip(cmb_renderer, "Auto tries CairoSVG first, then Inkscape. Inkscape is usually easiest on Windows.")
+        self.add_tip(
+            cmb_fit,
+            "Contain = preserve the whole image. Cover = fill the icon and crop overflow. Stretch = force the image into a square.",
+        )
+        self.add_tip(
+            cmb_existing,
+            "Skip leaves existing ICOs alone. Overwrite replaces them. Unique creates files like name (2).ico.",
+        )
+        self.add_tip(
+            cmb_renderer,
+            "Auto tries CairoSVG first, then Inkscape. Choose Inkscape if CairoSVG produces missing Cairo DLL errors on Windows.",
+        )
         self.add_tip(spn_svg, "Higher values can improve SVG edge quality, but may slightly slow conversion.")
 
         pad_box = ttk.LabelFrame(frame, text="Padding", padding=8, style="Card.TLabelframe")
         pad_box.grid(row=2, column=0, columnspan=2, sticky="ew", padx=(0, 10), pady=(12, 0))
         pad_box.columnconfigure(1, weight=1)
-        ttk.Radiobutton(pad_box, text="Preset", value="preset", variable=self.padding_mode_var, command=self.refresh_padding_controls).grid(row=0, column=0, sticky="w")
-        ttk.Radiobutton(pad_box, text="Custom %", value="custom", variable=self.padding_mode_var, command=self.refresh_padding_controls).grid(row=1, column=0, sticky="w", pady=(6, 0))
-        cmb_padding = ttk.Combobox(pad_box, textvariable=self.padding_preset_var, values=COMMON_PADDING_PERCENTS, state="readonly", width=8)
+        rad_pad_preset = ttk.Radiobutton(
+            pad_box,
+            text="Preset",
+            value="preset",
+            variable=self.padding_mode_var,
+            command=self.refresh_padding_controls,
+        )
+        rad_pad_custom = ttk.Radiobutton(
+            pad_box,
+            text="Custom %",
+            value="custom",
+            variable=self.padding_mode_var,
+            command=self.refresh_padding_controls,
+        )
+        rad_pad_preset.grid(row=0, column=0, sticky="w")
+        rad_pad_custom.grid(row=1, column=0, sticky="w", pady=(6, 0))
+        cmb_padding = ttk.Combobox(
+            pad_box,
+            textvariable=self.padding_preset_var,
+            values=COMMON_PADDING_PERCENTS,
+            state="readonly",
+            width=8,
+        )
         cmb_padding.grid(row=0, column=1, sticky="w", padx=(8, 0))
-        ttk.Label(pad_box, text="% around artwork").grid(row=0, column=2, sticky="w", padx=(8, 0))
+        ttk.Label(pad_box, text="% padding around artwork").grid(row=0, column=2, sticky="w", padx=(8, 0))
         self.padding_custom_entry = ttk.Entry(pad_box, textvariable=self.padding_custom_var, width=10)
         self.padding_custom_entry.grid(row=1, column=1, sticky="w", padx=(8, 0), pady=(6, 0))
-        ttk.Label(pad_box, text="0–40").grid(row=1, column=2, sticky="w", padx=(8, 0), pady=(6, 0))
-        self.add_tip(pad_box, "Padding adds empty space around the artwork so icons do not look cramped in Windows.")
+        ttk.Label(pad_box, text="Enter 0–40").grid(row=1, column=2, sticky="w", padx=(8, 0), pady=(6, 0))
+        self.add_tip(
+            pad_box,
+            "Padding adds empty space around the artwork. This helps icons avoid looking cramped in Windows.",
+        )
+        self.add_tip(cmb_padding, "Common padding presets for fast setup.")
+        self.add_tip(self.padding_custom_entry, "Enter a custom padding percent between 0 and 40.")
 
         bg_box = ttk.LabelFrame(frame, text="Background", padding=8, style="Card.TLabelframe")
         bg_box.grid(row=2, column=2, columnspan=3, sticky="ew", pady=(12, 0))
@@ -702,14 +803,27 @@ class IcoConverterApp:
             ("Black", "black", 2),
             ("Custom", "custom", 3),
         ]:
-            ttk.Radiobutton(bg_box, text=text, value=value, variable=self.background_mode_var, command=self.refresh_background_controls).grid(row=0, column=col, sticky="w", padx=(0, 10))
+            ttk.Radiobutton(
+                bg_box,
+                text=text,
+                value=value,
+                variable=self.background_mode_var,
+                command=self.refresh_background_controls,
+            ).grid(row=0, column=col, sticky="w", padx=(0, 10))
         self.background_custom_entry = ttk.Entry(bg_box, textvariable=self.background_custom_var, width=12)
         self.background_custom_entry.grid(row=1, column=0, sticky="w", pady=(8, 0), columnspan=2)
-        self.background_pick_button = ttk.Button(bg_box, text="Pick Color", style="Soft.TButton", command=self.pick_background_color)
+        self.background_pick_button = ttk.Button(
+            bg_box,
+            text="Pick Color",
+            style="Soft.TButton",
+            command=self.pick_background_color,
+        )
         self.background_pick_button.grid(row=1, column=2, sticky="w", pady=(8, 0))
         self.background_preview = tk.Label(bg_box, width=3, relief="solid", borderwidth=1, bg="#ffffff")
         self.background_preview.grid(row=1, column=3, sticky="w", padx=(8, 0), pady=(8, 0))
         self.add_tip(bg_box, "Choose whether the icon canvas should stay transparent or be filled with a background color.")
+        self.add_tip(self.background_custom_entry, "For Custom, enter a HEX color such as #ffffff or click Pick Color.")
+        self.add_tip(self.background_pick_button, "Choose a custom background color visually.")
 
         row3 = ttk.Frame(frame)
         row3.grid(row=3, column=0, columnspan=5, sticky="ew", pady=(12, 0))
@@ -718,11 +832,21 @@ class IcoConverterApp:
         chk_report.grid(row=0, column=0, sticky="w")
         chk_ini = ttk.Checkbutton(row3, text="Write desktop.ini for folder icons", variable=self.write_desktop_ini_var)
         chk_ini.grid(row=0, column=1, sticky="w", padx=(16, 0))
-        chk_attr = ttk.Checkbutton(row3, text="Apply Windows folder/icon attributes", variable=self.apply_attributes_var)
+        chk_attr = ttk.Checkbutton(
+            row3,
+            text="Apply Windows folder/icon attributes",
+            variable=self.apply_attributes_var,
+        )
         chk_attr.grid(row=0, column=2, sticky="w", padx=(16, 0))
         self.add_tip(chk_report, "Writes a CSV report of converted, skipped, and failed files.")
-        self.add_tip(chk_ini, "Creates desktop.ini for folders that contain exactly one generated icon. Useful for folder icon customization.")
-        self.add_tip(chk_attr, "Applies hidden/system attributes used by Windows folder icon behavior when desktop.ini is written.")
+        self.add_tip(
+            chk_ini,
+            "Creates desktop.ini for folders that contain exactly one generated icon. Useful for folder icon customization.",
+        )
+        self.add_tip(
+            chk_attr,
+            "Applies hidden/system attributes used by Windows folder icon behavior when desktop.ini is written.",
+        )
 
         report_row = ttk.Frame(frame)
         report_row.grid(row=4, column=0, columnspan=5, sticky="ew", pady=(10, 0))
@@ -735,14 +859,33 @@ class IcoConverterApp:
         self.add_tip(report_entry, "Leave blank to auto-create a timestamped report when CSV reporting is enabled.")
         self.add_tip(report_btn, "Choose a specific CSV report file path.")
 
+        for widget, text in [
+            (lbl_sizes, "Choose which embedded sizes should be included in the ICO file."),
+            (lbl_fit, "Controls how the source artwork is fitted onto the square icon canvas."),
+            (lbl_existing, "What should happen if a target ICO file already exists."),
+            (lbl_renderer, "Controls which engine is used to turn SVG files into PNG before creating the ICO."),
+            (lbl_svg, "Controls SVG rasterization quality before the image is saved as ICO."),
+        ]:
+            self.add_tip(widget, text)
+
     def build_action_section(self, parent: ttk.Frame) -> None:
         frame = ttk.Frame(parent)
         frame.grid(row=3, column=0, sticky="ew", pady=(0, 10))
 
-        self.convert_button = ttk.Button(frame, text="Convert Icons", style="Primary.TButton", command=lambda: self.start_conversion(dry_run=False))
-        self.convert_button.pack(side="left")
-        self.dry_run_button = ttk.Button(frame, text="Dry Run", style="Success.TButton", command=lambda: self.start_conversion(dry_run=True))
-        self.dry_run_button.pack(side="left", padx=(8, 0))
+        btn_convert = ttk.Button(
+            frame,
+            text="Convert Icons",
+            style="Primary.TButton",
+            command=lambda: self.start_conversion(dry_run=False),
+        )
+        btn_convert.pack(side="left")
+        btn_dry = ttk.Button(
+            frame,
+            text="Dry Run",
+            style="Success.TButton",
+            command=lambda: self.start_conversion(dry_run=True),
+        )
+        btn_dry.pack(side="left", padx=(8, 0))
         btn_output = ttk.Button(frame, text="Open Output Folder", style="Soft.TButton", command=self.open_output_folder)
         btn_output.pack(side="left", padx=(8, 0))
         self.log_toggle_btn = ttk.Button(frame, text="Show Log", style="LogToggle.TButton", command=self.toggle_log_area)
@@ -750,9 +893,14 @@ class IcoConverterApp:
         btn_exit = ttk.Button(frame, text="Exit", style="Soft.TButton", command=self.root.destroy)
         btn_exit.pack(side="right")
 
-        self.add_tip(self.convert_button, "Convert all discovered PNG and SVG files into ICO files using the current settings.")
-        self.add_tip(self.dry_run_button, "Preview what would happen without writing any files.")
-        self.add_tip(btn_output, "Open the selected output folder, or the first source folder when output is saved next to source files.")
+        self.convert_button = btn_convert
+        self.dry_run_button = btn_dry
+        self.add_tip(btn_convert, "Convert all discovered PNG and SVG files into ICO files using the current settings.")
+        self.add_tip(btn_dry, "Preview what would happen without writing any files.")
+        self.add_tip(
+            btn_output,
+            "Open the selected output folder, or the first source folder when output is saved next to the source files.",
+        )
         self.add_tip(self.log_toggle_btn, "Show or hide the log section.")
         self.add_tip(btn_exit, "Close the application.")
 
@@ -796,7 +944,8 @@ class IcoConverterApp:
         self.preserve_tree_check.configure(state=state)
 
     def refresh_padding_controls(self) -> None:
-        self.padding_custom_entry.configure(state="normal" if self.padding_mode_var.get() == "custom" else "disabled")
+        custom = self.padding_mode_var.get() == "custom"
+        self.padding_custom_entry.configure(state="normal" if custom else "disabled")
 
     def refresh_background_controls(self) -> None:
         custom = self.background_mode_var.get() == "custom"
@@ -808,9 +957,13 @@ class IcoConverterApp:
     def update_background_preview(self) -> None:
         mode = self.background_mode_var.get()
         preview = "#ffffff"
-        if mode == "black":
+        if mode == "transparent":
+            preview = "#ffffff"
+        elif mode == "white":
+            preview = "#ffffff"
+        elif mode == "black":
             preview = "#000000"
-        elif mode == "custom":
+        else:
             raw = self.background_custom_var.get().strip()
             if re.fullmatch(r"#?[0-9a-fA-F]{6}", raw):
                 preview = raw if raw.startswith("#") else f"#{raw}"
@@ -819,7 +972,12 @@ class IcoConverterApp:
     def add_files(self) -> None:
         files = filedialog.askopenfilenames(
             title="Select PNG or SVG files",
-            filetypes=[("Icon artwork", "*.png *.svg"), ("PNG files", "*.png"), ("SVG files", "*.svg"), ("All files", "*.*")],
+            filetypes=[
+                ("Icon artwork", "*.png *.svg"),
+                ("PNG files", "*.png"),
+                ("SVG files", "*.svg"),
+                ("All files", "*.*"),
+            ],
         )
         for file_path in files:
             self.add_source_path(file_path)
@@ -886,8 +1044,7 @@ class IcoConverterApp:
     def log(self, message: str) -> None:
         if not self.log_visible.get():
             self.toggle_log_area()
-        self.log_text.insert("end", message + "
-")
+        self.log_text.insert("end", message + "\n")
         self.log_text.see("end")
         self.root.update_idletasks()
 
@@ -940,9 +1097,14 @@ class IcoConverterApp:
 
         padding = self.selected_padding_ratio()
         background = parse_background(self.selected_background_string())
+
         supersample = int(self.supersample_var.get())
         if supersample < 1 or supersample > 8:
             raise ValueError("SVG edge quality must be between 1 and 8.")
+
+        svg_renderer = self.svg_renderer_var.get().strip().lower()
+        if svg_renderer not in {"auto", "inkscape", "cairosvg"}:
+            raise ValueError("SVG renderer must be Auto, Inkscape, or CairoSVG.")
 
         report_path = Path(self.report_path_var.get()).expanduser().resolve() if self.report_path_var.get().strip() else None
 
@@ -955,9 +1117,9 @@ class IcoConverterApp:
             padding=padding,
             background=background,
             supersample=supersample,
+            svg_renderer=svg_renderer,
             existing_mode=self.existing_mode_var.get(),
             dry_run=dry_run,
-            svg_renderer=self.svg_renderer_var.get(),
         )
 
         return WorkerSettings(
@@ -1026,6 +1188,7 @@ class IcoConverterApp:
                         first_source = results[0].source
                         report_base = first_source.parent if first_source.parent.exists() else Path.cwd()
                     report_path = report_base / f"ico-conversion-report-{timestamp}.csv"
+
                 write_report(results, report_path)
                 self.work_queue.put(("message", f"Report written: {report_path}"))
 
@@ -1037,12 +1200,14 @@ class IcoConverterApp:
         try:
             while True:
                 event, payload = self.work_queue.get_nowait()
+
                 if event == "total":
                     self.total_files = max(1, int(payload))
                     self.progress.configure(maximum=self.total_files, value=0)
                 elif event == "result":
                     result = payload
-                    assert isinstance(result, ConversionResult)
+                    if not isinstance(result, ConversionResult):
+                        continue
                     self.completed_files += 1
                     self.progress.configure(value=self.completed_files)
                     target = f" -> {result.target}" if result.target else ""
@@ -1057,9 +1222,8 @@ class IcoConverterApp:
                     self.set_running_state(False)
                     return
                 elif event == "done":
-                    results = payload
-                    assert isinstance(results, list)
-                    self.show_done_summary(results)
+                    if isinstance(payload, list):
+                        self.show_done_summary(payload)
                     self.set_running_state(False)
                     return
         except queue.Empty:
@@ -1083,7 +1247,10 @@ class IcoConverterApp:
                 self.log(f"{status}: {counts[status]}")
 
         if counts.get("error"):
-            messagebox.showwarning("Finished with Errors", f"Finished with {counts['error']} error(s). Check the log or CSV report for details.")
+            messagebox.showwarning(
+                "Finished with Errors",
+                f"Finished with {counts['error']} error(s). Check the log or CSV report for details.",
+            )
         else:
             messagebox.showinfo("Done", "Finished successfully.")
 
