@@ -9,7 +9,8 @@ Required:
     py -3 -m pip install pillow
 
 Optional SVG support:
-    py -3 -m pip install cairosvg
+    Install Inkscape and leave SVG renderer set to Auto or Inkscape.
+    CairoSVG can also work, but on Windows it requires the native Cairo/GTK libraries.
 """
 
 from __future__ import annotations
@@ -18,7 +19,9 @@ import csv
 import os
 import queue
 import re
+import shutil
 import subprocess
+import tempfile
 import sys
 import threading
 from collections import defaultdict
@@ -77,6 +80,7 @@ class ConversionOptions:
     padding: float
     background: tuple[int, int, int, int] | None
     supersample: int
+    svg_renderer: str
     existing_mode: str
     dry_run: bool
 
@@ -200,26 +204,138 @@ def uniquify_path(path: Path) -> Path:
     raise RuntimeError(f"Could not create a unique file name for {path}")
 
 
-def load_svg(path: Path, render_width: int) -> Image.Image:
+def is_missing_cairo_error(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return any(
+        marker in text
+        for marker in [
+            "no library called",
+            "cairo-2",
+            "libcairo",
+            "cannot load library",
+        ]
+    )
+
+
+def concise_error(exc: BaseException, max_length: int = 260) -> str:
+    text = " ".join(str(exc).split())
+    if len(text) > max_length:
+        return text[: max_length - 3] + "..."
+    return text
+
+
+def find_inkscape() -> str | None:
+    exe = shutil.which("inkscape") or shutil.which("inkscape.exe")
+    if exe:
+        return exe
+
+    possible_roots = [
+        os.environ.get("ProgramFiles"),
+        os.environ.get("ProgramFiles(x86)"),
+        os.environ.get("LOCALAPPDATA"),
+    ]
+    possible_paths: list[Path] = []
+    for root in possible_roots:
+        if root:
+            possible_paths.extend(
+                [
+                    Path(root) / "Inkscape" / "bin" / "inkscape.exe",
+                    Path(root) / "Programs" / "Inkscape" / "bin" / "inkscape.exe",
+                ]
+            )
+
+    for path in possible_paths:
+        if path.exists():
+            return str(path)
+    return None
+
+
+def render_svg_with_cairosvg(path: Path, render_width: int) -> Image.Image:
     try:
         import cairosvg  # type: ignore
     except ImportError as exc:
-        raise RuntimeError(
-            "SVG conversion requires CairoSVG. Install it with: py -3 -m pip install cairosvg"
-        ) from exc
-    png_bytes = cairosvg.svg2png(url=str(path), output_width=render_width)
+        raise RuntimeError("CairoSVG is not installed. Install it with: py -3 -m pip install cairosvg") from exc
+
+    try:
+        png_bytes = cairosvg.svg2png(url=str(path), output_width=render_width)
+    except Exception as exc:  # noqa: BLE001
+        if is_missing_cairo_error(exc):
+            raise RuntimeError(
+                "CairoSVG is installed, but the native Cairo graphics library was not found. "
+                "Install GTK/Cairo for Windows or use the Inkscape SVG renderer."
+            ) from exc
+        raise RuntimeError(f"CairoSVG could not render this SVG: {concise_error(exc)}") from exc
+
     image = Image.open(BytesIO(png_bytes))
     image.load()
     return image.convert("RGBA")
 
 
-def load_image(path: Path, max_icon_size: int, supersample: int) -> Image.Image:
+def render_svg_with_inkscape(path: Path, render_width: int) -> Image.Image:
+    exe = find_inkscape()
+    if not exe:
+        raise RuntimeError(
+            "Inkscape was not found. Install Inkscape or add inkscape.exe to PATH, "
+            "then choose the Inkscape or Auto SVG renderer."
+        )
+
+    with tempfile.TemporaryDirectory(prefix="ico-svg-render-") as temp_dir:
+        output_png = Path(temp_dir) / "rendered.png"
+        command = [
+            exe,
+            str(path),
+            "--export-type=png",
+            f"--export-filename={output_png}",
+            f"--export-width={render_width}",
+            "--export-background-opacity=0",
+        ]
+        completed = subprocess.run(command, capture_output=True, text=True, check=False)
+        if completed.returncode != 0 or not output_png.exists():
+            stderr = completed.stderr.strip() or completed.stdout.strip() or "Unknown Inkscape export error."
+            raise RuntimeError(f"Inkscape could not render this SVG: {concise_error(RuntimeError(stderr))}")
+
+        image = Image.open(output_png)
+        image.load()
+        return image.convert("RGBA")
+
+
+def load_svg(path: Path, render_width: int, renderer: str) -> Image.Image:
+    renderer = renderer.lower().strip()
+    errors: list[str] = []
+
+    if renderer in {"auto", "cairosvg"}:
+        try:
+            return render_svg_with_cairosvg(path, render_width)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"CairoSVG: {concise_error(exc)}")
+            if renderer == "cairosvg":
+                raise RuntimeError(errors[-1]) from exc
+
+    if renderer in {"auto", "inkscape"}:
+        try:
+            return render_svg_with_inkscape(path, render_width)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"Inkscape: {concise_error(exc)}")
+            if renderer == "inkscape":
+                raise RuntimeError(errors[-1]) from exc
+
+    if not errors:
+        errors.append(f"Unknown SVG renderer: {renderer}")
+
+    raise RuntimeError(
+        "Could not render SVG. "
+        + " | ".join(errors)
+        + " Recommended fix: install Inkscape, then use SVG renderer = Auto or Inkscape."
+    )
+
+
+def load_image(path: Path, max_icon_size: int, supersample: int, svg_renderer: str) -> Image.Image:
     if not path.exists():
         raise RuntimeError("Source file does not exist.")
 
     if path.suffix.lower() == ".svg":
         render_width = max_icon_size * max(1, supersample)
-        return load_svg(path, render_width=render_width)
+        return load_svg(path, render_width=render_width, renderer=svg_renderer)
 
     try:
         image = Image.open(path)
@@ -277,7 +393,12 @@ def convert_one(source: Path, root: Path, options: ConversionOptions) -> Convers
         return ConversionResult(source, target, "dry-run", "Would convert.", ico_sizes=ico_sizes)
 
     try:
-        image = load_image(source, max_icon_size=max(options.sizes), supersample=options.supersample)
+        image = load_image(
+            source,
+            max_icon_size=max(options.sizes),
+            supersample=options.supersample,
+            svg_renderer=options.svg_renderer,
+        )
         source_size = f"{image.width}x{image.height}"
         base_icon = prepare_square_icon(
             image=image,
@@ -430,6 +551,7 @@ class IcoConverterApp:
         self.background_mode_var = tk.StringVar(value="transparent")
         self.background_custom_var = tk.StringVar(value="#ffffff")
         self.supersample_var = tk.IntVar(value=4)
+        self.svg_renderer_var = tk.StringVar(value="auto")
         self.existing_mode_var = tk.StringVar(value="skip")
         self.auto_report_var = tk.BooleanVar(value=True)
         self.report_path_var = tk.StringVar(value="")
@@ -575,8 +697,8 @@ class IcoConverterApp:
         lbl_fit.grid(row=0, column=1, sticky="w")
         lbl_existing = ttk.Label(frame, text="Existing files")
         lbl_existing.grid(row=0, column=2, sticky="w")
-        lbl_svg = ttk.Label(frame, text="SVG supersample")
-        lbl_svg.grid(row=0, column=3, sticky="w")
+        lbl_renderer = ttk.Label(frame, text="SVG renderer")
+        lbl_renderer.grid(row=0, column=3, sticky="w")
 
         self.sizes_menu = SizesMenu(frame, DEFAULT_ICO_SIZES, DEFAULT_ICO_SIZES)
         self.sizes_menu.grid(row=1, column=0, sticky="ew", padx=(0, 10))
@@ -594,12 +716,23 @@ class IcoConverterApp:
             state="readonly",
         )
         cmb_existing.grid(row=1, column=2, sticky="ew", padx=(0, 10))
+        cmb_renderer = ttk.Combobox(
+            frame,
+            textvariable=self.svg_renderer_var,
+            values=["auto", "inkscape", "cairosvg"],
+            state="readonly",
+        )
+        cmb_renderer.grid(row=1, column=3, sticky="ew")
+
+        lbl_svg = ttk.Label(frame, text="SVG supersample")
+        lbl_svg.grid(row=2, column=3, sticky="w", pady=(10, 0))
         spn_svg = ttk.Spinbox(frame, from_=1, to=8, textvariable=self.supersample_var, width=8)
-        spn_svg.grid(row=1, column=3, sticky="ew")
+        spn_svg.grid(row=3, column=3, sticky="ew", pady=(0, 0))
 
         self.add_tip(self.sizes_menu, "Choose one or more embedded icon sizes to include in the ICO file.")
         self.add_tip(cmb_fit, "Contain = preserve the whole image. Cover = fill the icon and crop overflow. Stretch = force the image into a square.")
         self.add_tip(cmb_existing, "Skip leaves existing ICOs alone. Overwrite replaces them. Unique creates files like name (2).ico.")
+        self.add_tip(cmb_renderer, "Auto tries CairoSVG first, then Inkscape. Choose Inkscape if CairoSVG produces missing Cairo DLL errors on Windows.")
         self.add_tip(spn_svg, "Higher values can improve SVG edge quality, but may slightly slow conversion.")
 
         # Padding section
@@ -717,6 +850,7 @@ class IcoConverterApp:
             (lbl_sizes, "Choose which embedded sizes should be included in the ICO file."),
             (lbl_fit, "Controls how the source artwork is fitted onto the square icon canvas."),
             (lbl_existing, "What should happen if a target ICO file already exists."),
+            (lbl_renderer, "Controls which engine is used to turn SVG files into PNG before creating the ICO."),
             (lbl_svg, "Controls SVG rasterization quality before the image is saved as ICO."),
         ]:
             self.add_tip(w, txt)
@@ -947,6 +1081,10 @@ class IcoConverterApp:
         if supersample < 1 or supersample > 8:
             raise ValueError("SVG supersample must be between 1 and 8.")
 
+        svg_renderer = self.svg_renderer_var.get().strip().lower()
+        if svg_renderer not in {"auto", "inkscape", "cairosvg"}:
+            raise ValueError("SVG renderer must be Auto, Inkscape, or CairoSVG.")
+
         report_path = Path(self.report_path_var.get()).expanduser().resolve() if self.report_path_var.get().strip() else None
 
         options = ConversionOptions(
@@ -958,6 +1096,7 @@ class IcoConverterApp:
             padding=padding,
             background=background,
             supersample=supersample,
+            svg_renderer=svg_renderer,
             existing_mode=self.existing_mode_var.get(),
             dry_run=dry_run,
         )
